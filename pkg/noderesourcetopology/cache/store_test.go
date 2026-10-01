@@ -1141,9 +1141,10 @@ func findResourceInfo(rinfos []topologyv1alpha2.ResourceInfo, name string) *topo
 }
 
 type fakePodLister struct {
-	pods   []*corev1.Pod
-	err    error
-	filter podprovider.PodFilterFunc
+	pods      []*corev1.Pod
+	err       error
+	errByNode map[string]error
+	filter    podprovider.PodFilterFunc
 }
 
 func (fpl *fakePodLister) AddPod(pod *corev1.Pod) {
@@ -1164,6 +1165,9 @@ func (fpl *fakePodLister) List(lh logr.Logger, selector labels.Selector) ([]*cor
 }
 
 func (fpl *fakePodLister) ListByNode(lh logr.Logger, nodeName string) ([]*corev1.Pod, error) {
+	if err, ok := fpl.errByNode[nodeName]; ok {
+		return nil, err
+	}
 	pods, err := fpl.List(lh, labels.Everything())
 	if err != nil {
 		return nil, err

@@ -25,6 +25,7 @@ import (
 
 	"github.com/go-logr/logr/testr"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
 	"github.com/k8stopologyawareschedwg/podfingerprint"
 
@@ -33,7 +34,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
 
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -1315,12 +1315,16 @@ func TestMakeNodeToPodDataMap(t *testing.T) {
 				err:    tcase.err,
 				filter: tcase.isPodRelevant,
 			}
-			nrtResourcesLookup := func(nodeName string) sets.Set[corev1.ResourceName] { return nil }
-			got, err := makeNodeToPodDataMap(testr.New(t), podLister, nodeNamesFromPods(tcase.pods), nrtResourcesLookup, apiconfig.PreemptionDisabled)
+			fakeClient, err := tu.NewFakeClient(makeTestNRT("node1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			nrtCache := mustOverReserve(t, fakeClient, podLister)
+			got, err := nrtCache.collectNodeData(context.Background(), testr.New(t), "node1")
 			if err != tcase.expectedErr {
 				t.Errorf("error mismatch: got %v expected %v", err, tcase.expectedErr)
 			}
-			if diff := cmp.Diff(got, tcase.expected); diff != "" {
+			if diff := cmp.Diff(got.Pods, tcase.expected["node1"], cmpopts.EquateEmpty()); diff != "" {
 				t.Errorf("unexpected result: %v", diff)
 			}
 		})
@@ -1560,12 +1564,24 @@ func TestMakeNodeToPodDataMapWithExclusiveResources(t *testing.T) {
 				err:    tcase.err,
 				filter: tcase.isPodRelevant,
 			}
-			nrtResourcesLookup := func(nodeName string) sets.Set[corev1.ResourceName] { return nil }
-			got, err := makeNodeToPodDataMap(testr.New(t), podLister, nodeNamesFromPods(tcase.pods), nrtResourcesLookup, tcase.preemptionMode)
+			fakeClient, err := tu.NewFakeClient(makeTestNRT("node1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			mode := tcase.preemptionMode
+			if mode == "" {
+				mode = apiconfig.PreemptionDisabled
+			}
+			nrtCache, err := NewOverReserve(context.Background(), testr.New(t), nil, fakeClient, podLister, mode)
+			if err != nil {
+				t.Fatalf("unexpected error creating cache: %v", err)
+			}
+			t.Cleanup(nrtCache.Close)
+			got, err := nrtCache.collectNodeData(context.Background(), testr.New(t), "node1")
 			if err != tcase.expectedErr {
 				t.Errorf("error mismatch: got %v expected %v", err, tcase.expectedErr)
 			}
-			if diff := cmp.Diff(got, tcase.expected); diff != "" {
+			if diff := cmp.Diff(got.Pods, tcase.expected["node1"], cmpopts.EquateEmpty()); diff != "" {
 				t.Errorf("unexpected result: %v", diff)
 			}
 		})
@@ -1619,14 +1635,4 @@ func TestOverresevedGetCachedNRTCopyWithForeignPods(t *testing.T) {
 	if gotInfo.Fresh {
 		t.Errorf("cached data reported fresh when node has foreign pods")
 	}
-}
-
-func nodeNamesFromPods(pods []*corev1.Pod) []string {
-	names := sets.New[string]()
-	for _, pod := range pods {
-		if pod.Spec.NodeName != "" {
-			names.Insert(pod.Spec.NodeName)
-		}
-	}
-	return names.UnsortedList()
 }
