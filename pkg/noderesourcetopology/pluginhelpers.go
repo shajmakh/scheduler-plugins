@@ -70,12 +70,42 @@ func initNodeTopologyInformer(ctx context.Context, lh logr.Logger,
 	initNodeTopologyForeignPodsDetection(lh, tcfg.Cache, handle, podSharedInformer, nrtCache)
 	initSameProfileTerminatedPodsDetection(lh, handle, podSharedInformer, nrtCache)
 
+	profileName := handle.ProfileName()
+	if profileName == "" {
+		lh.Info("scheduler profile name missing; will not activate unschedulable pods after cache flush")
+	} else {
+		nrtCache.SetUnschedulablePodActivator(profileName, newUnschedulablePodActivator(handle))
+	}
+
 	resyncPeriod := time.Duration(tcfg.CacheResyncPeriodSeconds) * time.Second
 	go wait.Forever(nrtCache.Resync, resyncPeriod)
 
 	lh.V(3).Info("enable NodeTopology cache (needs the Reserve plugin)", "resyncPeriod", resyncPeriod)
 
 	return nrtCache, nil
+}
+
+// newUnschedulablePodActivator moves the given pods to the scheduler active queue.
+// Pods that are not parked in the unschedulable or backoff queues are ignored by the scheduler.
+func newUnschedulablePodActivator(handle fwk.Handle) nrtcache.PodActivator {
+	return func(lh logr.Logger, pods []*corev1.Pod) {
+		if len(pods) == 0 {
+			return
+		}
+		toActivate := make(map[string]*corev1.Pod, len(pods))
+		for _, pod := range pods {
+			key, err := k8scache.MetaNamespaceKeyFunc(pod)
+			if err != nil {
+				lh.Error(err, "skipping pod activation", logging.KeyPod, pod.Namespace+"/"+pod.Name)
+				continue
+			}
+			toActivate[key] = pod
+		}
+		if len(toActivate) == 0 {
+			return
+		}
+		handle.Activate(lh, toActivate)
+	}
 }
 
 func initNodeTopologyForeignPodsDetection(lh logr.Logger, cfg *apiconfig.NodeResourceTopologyCache, handle fwk.Handle, podSharedInformer k8scache.SharedInformer, nrtCache *nrtcache.OverReserve) {

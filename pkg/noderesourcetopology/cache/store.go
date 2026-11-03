@@ -177,6 +177,18 @@ func (rs *nrtResourcesStore) Delete(nodeName string) {
 	delete(rs.data, nodeName)
 }
 
+// Union returns every resource name published by any cached NRT.
+// Pending pods are not bound to a node, so exclusive-resource checks use this cluster-wide set.
+func (rs *nrtResourcesStore) Union() sets.Set[corev1.ResourceName] {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	out := sets.New[corev1.ResourceName]()
+	for _, names := range rs.data {
+		out = out.Union(names)
+	}
+	return out
+}
+
 func getNUMAPlacementInfo(lh logr.Logger, nrt topologyv1alpha2.NodeResourceTopology, pods []podData) numaplacement.EncodedInfo {
 	nname := nrt.Name
 	lh.V(6).Info("nrt numaplacement info extraction: starting", "node", nname)

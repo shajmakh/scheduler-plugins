@@ -70,14 +70,18 @@ type OverReserve struct {
 	nodesWithBlockingUpdates counter
 	nodesWithAttrUpdate      counter
 	podLister                podlisterv1.PodLister
-	resyncMethod             apiconfig.CacheResyncMethod
-	resyncScope              apiconfig.CacheResyncScope
-	isPodRelevant            podprovider.PodFilterFunc
-	preemptionMode           apiconfig.PreemptionMode
-	nrtUpdateCh              chan NRTEvent
-	watchCancel              context.CancelFunc
-	nrtWatcher               *Watcher
-	closeOnce                sync.Once
+	// profileName is the scheduler profile that owns this cache. Together with podActivator
+	// it selects which parked pods to move back to the scheduling queue after a !Fresh node is flushed.
+	profileName    string
+	podActivator   PodActivator
+	resyncMethod   apiconfig.CacheResyncMethod
+	resyncScope    apiconfig.CacheResyncScope
+	isPodRelevant  podprovider.PodFilterFunc
+	preemptionMode apiconfig.PreemptionMode
+	nrtUpdateCh    chan NRTEvent
+	watchCancel    context.CancelFunc
+	nrtWatcher     *Watcher
+	closeOnce      sync.Once
 }
 
 func NewOverReserve(
@@ -456,29 +460,48 @@ func (ov *OverReserve) makeNRTUpdatesForNodes(ctx context.Context, lh_ logr.Logg
 }
 
 // FlushNodes drops all the cached information about a given node, resetting its state clean.
+// When that flush clears a node blocked on stale topology (!Fresh), unschedulable pods of this
+// scheduler profile that request exclusive resources are moved back to the scheduling queue.
+// Filter rejects !Fresh nodes as UnschedulableAndUnresolvable, and a cache flush is not a
+// cluster event, so those pods would otherwise stay parked until a node allocatable change
+// or the unschedulable timeout.
 func (ov *OverReserve) FlushNodes(lh logr.Logger, nrtUpdates ...nrtUpdate) uint64 {
+	gen, clearedBlocking := ov.flushNodes(lh, nrtUpdates...)
+	if clearedBlocking {
+		ov.activateUnschedulableExclusivePods(lh)
+	}
+	return gen
+}
+
+// flushNodes applies nrtUpdates under the cache lock.
+// clearedBlocking is true when at least one flushed node was previously !Fresh.
+func (ov *OverReserve) flushNodes(lh logr.Logger, nrtUpdates ...nrtUpdate) (uint64, bool) {
 	ov.lock.Lock()
 	defer ov.lock.Unlock()
 
 	if len(nrtUpdates) == 0 {
-		return ov.generation
+		return ov.generation, false
 	}
 
+	clearedBlocking := false
 	for _, nrtUpdate := range nrtUpdates {
-		lh.V(2).Info("flushing", logging.KeyNode, nrtUpdate.nrt.Name)
+		nodeName := nrtUpdate.nrt.Name
+		lh.V(2).Info("flushing", logging.KeyNode, nodeName)
+		if ov.nodesWithBlockingUpdates.IsSet(nodeName) {
+			clearedBlocking = true
+		}
 		ov.nrts.Update(nrtUpdate)
 		ov.nrtResNames.Update(nrtUpdate.nrt)
-		delete(ov.assumedResources, nrtUpdate.nrt.Name)
-		ov.nodesMaybeOverreserved.Delete(nrtUpdate.nrt.Name)
-		ov.nodesWithBlockingUpdates.Delete(nrtUpdate.nrt.Name)
-		ov.nodesWithAttrUpdate.Delete(nrtUpdate.nrt.Name)
+		delete(ov.assumedResources, nodeName)
+		ov.nodesMaybeOverreserved.Delete(nodeName)
+		ov.nodesWithBlockingUpdates.Delete(nodeName)
+		ov.nodesWithAttrUpdate.Delete(nodeName)
 	}
 
 	// increase only if we mutated the internal state
 	ov.generation += 1
 	lh.V(2).Info("generation", "new", ov.generation)
-	return ov.generation
-
+	return ov.generation, clearedBlocking
 }
 
 // to be used only in tests
