@@ -244,6 +244,11 @@ func (tm *TopologyMatch) Filter(ctx context.Context, cycleState fwk.CycleState, 
 	if !isPreemptionFlow && status != nil {
 		tm.nrtCache.NodeMaybeOverReserved(nodeName, pod)
 	}
+
+	if (status != nil || status.IsRejected()) && info.WithTerminatedPods {
+		// avoid false Unschedulable that could trigger preemption by returning a UnschedulableAndUnresolvable error
+		return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "node is marked with terminated same-profile pods")
+	}
 	return status
 }
 

@@ -62,19 +62,19 @@ type OverReserve struct {
 	// nodesMaybeOverreserved counts how many times a node is filtered out. This is used as trigger condition to try
 	// to resync nodes. See The documentation of Resync() below for more details.
 	nodesMaybeOverreserved counter
-	// nodesWithBlockingUpdates counts how many times a node is filtered out due to updates that the NRT profile has
-	// no control over and cannot make guarantees about. When the node is marked with this counter, the node is blocked
-	// from scheduling until the next Resync+PFP flush.
-	nodesWithBlockingUpdates counter
-	nodesWithAttrUpdate      counter
-	podLister                podprovider.Lister
-	resyncMethod             apiconfig.CacheResyncMethod
-	resyncScope              apiconfig.CacheResyncScope
-	preemptionMode           apiconfig.PreemptionMode
-	nrtUpdateCh              chan NRTEvent
-	watchCancel              context.CancelFunc
-	nrtWatcher               *Watcher
-	closeOnce                sync.Once
+	nodesWithForeignPods   counter
+	// nodesWithTerminatedPods counts how many times the node is marked with terminated same-profile pods. This is used to
+	// avoid false Unschedulable that could trigger preemption, and instead the Filter returns a UnschedulableAndUnresolvable error.
+	nodesWithTerminatedPods counter
+	nodesWithAttrUpdate     counter
+	podLister               podprovider.Lister
+	resyncMethod            apiconfig.CacheResyncMethod
+	resyncScope             apiconfig.CacheResyncScope
+	preemptionMode          apiconfig.PreemptionMode
+	nrtUpdateCh             chan NRTEvent
+	watchCancel             context.CancelFunc
+	nrtWatcher              *Watcher
+	closeOnce               sync.Once
 }
 
 func NewOverReserve(
@@ -100,19 +100,20 @@ func NewOverReserve(
 	lh.V(2).Info("initializing", "noderesourcetopologies", len(nrtObjs.Items), "method", resyncMethod, "scope", resyncScope)
 	watcherCtx, watchCancel := context.WithCancel(ctx)
 	obj := &OverReserve{
-		lh:                       lh,
-		client:                   client,
-		nrts:                     newNrtStore(lh, nrtObjs.Items),
-		nrtResNames:              newNrtResourcesStore(nrtObjs.Items),
-		assumedResources:         make(map[string]*resourceStore),
-		nodesMaybeOverreserved:   newCounter(),
-		nodesWithBlockingUpdates: newCounter(),
-		nodesWithAttrUpdate:      newCounter(),
-		nrtUpdateCh:              make(chan NRTEvent, defaultMaxNRTUpdates),
-		podLister:                podLister,
-		resyncMethod:             resyncMethod,
-		preemptionMode:           preemptionMode,
-		watchCancel:              watchCancel,
+		lh:                      lh,
+		client:                  client,
+		nrts:                    newNrtStore(lh, nrtObjs.Items),
+		nrtResNames:             newNrtResourcesStore(nrtObjs.Items),
+		assumedResources:        make(map[string]*resourceStore),
+		nodesMaybeOverreserved:  newCounter(),
+		nodesWithForeignPods:    newCounter(),
+		nodesWithTerminatedPods: newCounter(),
+		nodesWithAttrUpdate:     newCounter(),
+		nrtUpdateCh:             make(chan NRTEvent, defaultMaxNRTUpdates),
+		podLister:               podLister,
+		resyncMethod:            resyncMethod,
+		preemptionMode:          preemptionMode,
+		watchCancel:             watchCancel,
 	}
 
 	if resyncScope == apiconfig.CacheResyncScopeAll {
@@ -129,11 +130,12 @@ func (ov *OverReserve) GetCachedNRTCopy(ctx context.Context, nodeName string, po
 	ov.lock.Lock()
 	defer ov.lock.Unlock()
 	info := CachedNRTInfo{Generation: ov.generation}
-	if ov.nodesWithBlockingUpdates.IsSet(nodeName) {
+	if ov.nodesWithForeignPods.IsSet(nodeName) {
 		return nil, info
 	}
 
 	info.Fresh = true
+	info.WithTerminatedPods = ov.nodesWithTerminatedPods.IsSet(nodeName)
 	nrt := ov.nrts.GetNRTCopyByNodeName(nodeName)
 	if nrt == nil {
 		return nil, info
@@ -174,7 +176,7 @@ func (ov *OverReserve) NodeHasForeignPods(nodeName string, pod *corev1.Pod) {
 		lh.V(5).Info("ignoring foreign pods", "nrtinfo", "missing")
 		return
 	}
-	val := ov.nodesWithBlockingUpdates.Incr(nodeName)
+	val := ov.nodesWithForeignPods.Incr(nodeName)
 	lh.V(2).Info("marked with foreign pods", logging.KeyNode, nodeName, "count", val)
 }
 
@@ -219,8 +221,8 @@ func (ov *OverReserve) PostBind(nodeName string, pod *corev1.Pod) {}
 //   - If the pod is still tracked in assumedResources, clear that overlay and mark the
 //     node dirty (NodeMaybeOverReserved) so Resync can refresh later. The node stays Fresh.
 //   - If the pod is not in assumedResources, the cached NRT Available may still reflect it.
-//     Mark the node !Fresh (same mechanism as foreign pods) so Filter blocks the node until
-//     the next Resync+PFP flush, avoiding false Unschedulable that could trigger preemption.
+//     Mark the node WithTerminatedPods so that in case Filter fails to find the node fit for
+//     scheduling, it will return a UnschedulableAndUnresolvable error and avoid triggering preemption.
 func (ov *OverReserve) RemoveAssumedPodOnTermination(nodeName string, pod *corev1.Pod) {
 	lh := ov.lh.WithValues(logging.KeyPod, klog.KObj(pod), logging.KeyPodUID, logging.PodUID(pod), logging.KeyNode, nodeName)
 	ov.lock.Lock()
@@ -241,7 +243,7 @@ func (ov *OverReserve) RemoveAssumedPodOnTermination(nodeName string, pod *corev
 		lh.V(5).Info("ignoring terminated pod without node entry", "nrtinfo", "missing")
 		return
 	}
-	val := ov.nodesWithBlockingUpdates.Incr(nodeName)
+	val := ov.nodesWithTerminatedPods.Incr(nodeName)
 	lh.V(2).Info("terminated pod not in assumed; block scheduling on node until resync", "count", val)
 }
 
@@ -300,8 +302,12 @@ func (ov *OverReserve) GetDesyncedNodes(lh logr.Logger) DesyncedNodes {
 	// exhausted. We do like this because this is the safest approach. We will optimize
 	// the node selection logic later on to make the resync procedure less aggressive but
 	// still correct.
-	nodes := ov.nodesWithBlockingUpdates.Clone()
+	nodes := ov.nodesWithForeignPods.Clone()
 	foreignCount := nodes.Len()
+	terminatedCount := ov.nodesWithTerminatedPods.Len()
+	for _, node := range ov.nodesWithTerminatedPods.Keys() {
+		nodes.Incr(node)
+	}
 
 	overreservedCount := ov.nodesMaybeOverreserved.Len()
 	for _, node := range ov.nodesMaybeOverreserved.Keys() {
@@ -313,7 +319,7 @@ func (ov *OverReserve) GetDesyncedNodes(lh logr.Logger) DesyncedNodes {
 	configChangeCount := configChangeNodes.Len()
 
 	if nodes.Len() > 0 {
-		lh.V(4).Info("found dirty nodes", "foreign", foreignCount, "discarded", overreservedCount, "configChange", configChangeCount, "total", nodes.Len())
+		lh.V(4).Info("found dirty nodes", "foreign", foreignCount, "terminated", terminatedCount, "discarded", overreservedCount, "configChange", configChangeCount, "total", nodes.Len())
 	}
 	return DesyncedNodes{
 		Generation:        ov.generation,
@@ -455,7 +461,8 @@ func (ov *OverReserve) FlushNodes(lh logr.Logger, nrtUpdates ...nrtUpdate) uint6
 		ov.nrtResNames.Update(nrtUpdate.nrt)
 		delete(ov.assumedResources, nrtUpdate.nrt.Name)
 		ov.nodesMaybeOverreserved.Delete(nrtUpdate.nrt.Name)
-		ov.nodesWithBlockingUpdates.Delete(nrtUpdate.nrt.Name)
+		ov.nodesWithForeignPods.Delete(nrtUpdate.nrt.Name)
+		ov.nodesWithTerminatedPods.Delete(nrtUpdate.nrt.Name)
 		ov.nodesWithAttrUpdate.Delete(nrtUpdate.nrt.Name)
 	}
 
