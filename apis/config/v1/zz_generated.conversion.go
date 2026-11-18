@@ -419,6 +419,7 @@ func autoConvert_v1_NodeResourceTopologyCache_To_config_NodeResourceTopologyCach
 	out.ResyncMethod = (*config.CacheResyncMethod)(unsafe.Pointer(in.ResyncMethod))
 	out.InformerMode = (*config.CacheInformerMode)(unsafe.Pointer(in.InformerMode))
 	out.ResyncScope = (*config.CacheResyncScope)(unsafe.Pointer(in.ResyncScope))
+	out.RequeueUnschedulablePods = (*config.RequeueUnschedulablePodsMode)(unsafe.Pointer(in.RequeueUnschedulablePods))
 	return nil
 }
 
@@ -433,6 +434,7 @@ func autoConvert_config_NodeResourceTopologyCache_To_v1_NodeResourceTopologyCach
 	out.ResyncMethod = (*CacheResyncMethod)(unsafe.Pointer(in.ResyncMethod))
 	out.InformerMode = (*CacheInformerMode)(unsafe.Pointer(in.InformerMode))
 	out.ResyncScope = (*CacheResyncScope)(unsafe.Pointer(in.ResyncScope))
+	out.RequeueUnschedulablePods = (*RequeueUnschedulablePodsMode)(unsafe.Pointer(in.RequeueUnschedulablePods))
 	return nil
 }
 

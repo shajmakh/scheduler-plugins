@@ -18,6 +18,7 @@ package noderesourcetopology
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -65,61 +66,103 @@ func initNodeTopologyInformer(ctx context.Context, lh logr.Logger,
 		return nil, err
 	}
 
-	nrtCache, err := nrtcache.NewOverReserve(ctx, lh.WithName(logging.SubsystemNRTCache), tcfg.Cache, client, podLister, *tcfg.PreemptionMode)
+	ovCache, err := nrtcache.NewOverReserve(ctx, lh.WithName(logging.SubsystemNRTCache), tcfg.Cache, client, podLister, *tcfg.PreemptionMode)
 	if err != nil {
 		return nil, err
 	}
 
-	initNodeTopologyPodDetection(lh, tcfg.Cache, handle, podSharedInformer, nrtCache, *tcfg.PreemptionMode)
+	fwk, ok := handle.(framework.Framework)
+	if !ok || fwk.ProfileName() == "" {
+		lh.Info("cannot determine the scheduler profile name")
+		return nil, fmt.Errorf("cannot determine the scheduler profile name")
+	}
+	profileName := fwk.ProfileName()
+
+	initNodeTopologyPodDetection(lh, tcfg.Cache, profileName, podSharedInformer, ovCache, *tcfg.PreemptionMode)
+	var postResyncHandler *rejectedPodWaker
+	if ovCache.RequeuesRejectedPods() {
+		postResyncHandler = newRejectedPodWaker(handle, profileName, ovCache)
+	}
 
 	resyncPeriod := time.Duration(tcfg.CacheResyncPeriodSeconds) * time.Second
-	go wait.Forever(nrtCache.Resync, resyncPeriod)
+
+	go wait.Forever(func() {
+		flushed := ovCache.Resync()
+		if postResyncHandler == nil || len(flushed) == 0 {
+			return
+		}
+		postResyncHandler.wake(lh, flushed)
+	}, resyncPeriod)
 
 	lh.V(3).Info("enable NodeTopology cache (needs the Reserve plugin)", "resyncPeriod", resyncPeriod)
 
-	return nrtCache, nil
+	return ovCache, nil
 }
 
-func initNodeTopologyPodDetection(lh logr.Logger, cfg *apiconfig.NodeResourceTopologyCache, handle fwk.Handle, podSharedInformer k8scache.SharedInformer, nrtCache *nrtcache.OverReserve, preemptionMode apiconfig.PreemptionMode) {
-	foreignPodsDetect := getForeignPodsDetectMode(lh, cfg)
-	terminatedOwnPodsDetect := getTerminatedOwnPodsDetectMode(lh, cfg, preemptionMode)
+func initNodeTopologyPodDetection(lh logr.Logger, cfg *apiconfig.NodeResourceTopologyCache, profileName string, podSharedInformer k8scache.SharedInformer, nrtCache *nrtcache.OverReserve, preemptionMode apiconfig.PreemptionMode) {
+	if podSharedInformer == nil {
+		lh.Info("pod informer missing")
+		return
+	}
 
+	lh = lh.WithValues("profileName", profileName)
+	opts := &nrtcache.PodCacheHandlersOpts{}
+
+	setupForeignPodsDetection(lh, cfg, profileName, opts)
+	setupTerminatedOwnPodsDetection(lh, cfg, preemptionMode, opts)
+	setupRejectedPodsDetection(lh, cfg, profileName, nrtCache, opts)
+
+	nrtcache.SetupPodCacheHandlers(lh.WithName(logging.SubsystemNRTCache), profileName, podSharedInformer, nrtCache, *opts)
+}
+
+func setupForeignPodsDetection(lh logr.Logger, cfg *apiconfig.NodeResourceTopologyCache, profileName string, opts *nrtcache.PodCacheHandlersOpts) {
+	foreignPodsDetect := getForeignPodsDetectMode(lh, cfg)
 	foreignEnabled := foreignPodsDetect != apiconfig.ForeignPodsDetectNone
 	if !foreignEnabled {
 		lh.Info("foreign pods detection disabled by configuration")
+		return
 	}
+
+	lh.Info("setting up foreign pods detection", "mode", foreignPodsDetect)
+	if foreignPodsDetect == apiconfig.ForeignPodsDetectOnlyExclusiveResources {
+		nrtcache.TrackOnlyForeignPodsWithExclusiveResources()
+	} else {
+		nrtcache.TrackAllForeignPods()
+	}
+	nrtcache.RegisterSchedulerProfileName(lh.WithName(logging.SubsystemForeignPods), profileName)
+	opts.ForeignPodsDetect = foreignEnabled
+}
+
+func setupTerminatedOwnPodsDetection(lh logr.Logger, cfg *apiconfig.NodeResourceTopologyCache, preemptionMode apiconfig.PreemptionMode, opts *nrtcache.PodCacheHandlersOpts) {
+	terminatedOwnPodsDetect := getTerminatedOwnPodsDetectMode(lh, cfg, preemptionMode)
 	terminatedEnabled := terminatedOwnPodsDetect != apiconfig.TerminatedOwnPodsDetectNone
 	if !terminatedEnabled {
 		lh.Info("terminated own-pods detection disabled by configuration")
-	}
-	if !foreignEnabled && !terminatedEnabled {
 		return
 	}
 
-	fwk, ok := handle.(framework.Framework)
-	if !ok {
-		lh.Info("cannot determine the scheduler profile name - no pod detection handlers enabled")
+	lh.Info("setting up terminated own-pods detection", "mode", terminatedOwnPodsDetect)
+	opts.TerminatedOwnPodsDetect = terminatedEnabled
+}
+
+func setupRejectedPodsDetection(lh logr.Logger, cfg *apiconfig.NodeResourceTopologyCache, profileName string, nrtCache *nrtcache.OverReserve, opts *nrtcache.PodCacheHandlersOpts) {
+	requeueEnabled := requeueUnschedulablePodsEnabled(cfg)
+	if !requeueEnabled {
+		lh.Info("rejected pod requeue disabled by configuration")
 		return
 	}
 
-	profileName := fwk.ProfileName()
-	if foreignEnabled {
-		lh.Info("setting up foreign pods detection", "name", profileName, "mode", foreignPodsDetect)
-		if foreignPodsDetect == apiconfig.ForeignPodsDetectOnlyExclusiveResources {
-			nrtcache.TrackOnlyForeignPodsWithExclusiveResources()
-		} else {
-			nrtcache.TrackAllForeignPods()
-		}
-		nrtcache.RegisterSchedulerProfileName(lh.WithName(logging.SubsystemForeignPods), profileName)
-	}
-	if terminatedEnabled {
-		lh.Info("setting up terminated own-pods detection", "name", profileName, "mode", terminatedOwnPodsDetect)
-	}
+	lh.Info("enabling rejected pod requeue", "name", profileName)
+	nrtCache.EnableRequeueUnschedulablePods()
+	opts.ForgetRejectedPods = requeueEnabled
+}
 
-	nrtcache.SetupPodCacheHandlers(lh.WithName(logging.SubsystemNRTCache), profileName, podSharedInformer, nrtCache, nrtcache.PodCacheHandlersOpts{
-		ForeignPodsDetect:       foreignEnabled,
-		TerminatedOwnPodsDetect: terminatedEnabled,
-	})
+// requeueUnschedulablePodsEnabled reports whether cache.requeueUnschedulablePods is enabled.
+// Only OnlyExclusiveResources turns the feature on.
+func requeueUnschedulablePodsEnabled(cfg *apiconfig.NodeResourceTopologyCache) bool {
+	return cfg != nil &&
+		cfg.RequeueUnschedulablePods != nil &&
+		*cfg.RequeueUnschedulablePods == apiconfig.RequeueUnschedulablePodsOnlyExclusiveResources
 }
 
 func createNUMANodeList(lh logr.Logger, zones topologyv1alpha2.ZoneList) NUMANodeList {

@@ -30,6 +30,7 @@ import (
 	bm "k8s.io/kubernetes/pkg/kubelet/cm/topologymanager/bitmask"
 
 	apiconfig "sigs.k8s.io/scheduler-plugins/apis/config"
+	nrtcache "sigs.k8s.io/scheduler-plugins/pkg/noderesourcetopology/cache"
 	"sigs.k8s.io/scheduler-plugins/pkg/noderesourcetopology/logging"
 	"sigs.k8s.io/scheduler-plugins/pkg/noderesourcetopology/nodeconfig"
 	"sigs.k8s.io/scheduler-plugins/pkg/noderesourcetopology/preemption"
@@ -197,6 +198,7 @@ func (tm *TopologyMatch) Filter(ctx context.Context, cycleState fwk.CycleState, 
 	lh = lh.WithValues(logging.KeyGeneration, info.Generation)
 	if !info.Fresh {
 		lh.V(2).Info("invalid topology data")
+		tm.noteRejectedPod(pod)
 		return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "invalid node topology data")
 	}
 	if nodeTopology == nil {
@@ -216,6 +218,7 @@ func (tm *TopologyMatch) Filter(ctx context.Context, cycleState fwk.CycleState, 
 			if err != nil {
 				// valid NUMA placement info aligns with having a fresh PFP hence use OverReserved signal to resync with the PFP gate
 				tm.nrtCache.NodeMaybeOverReserved(nodeName, pod)
+				tm.noteRejectedPod(pod)
 				return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "eviction simulation in NRT is not possible: "+err.Error())
 			}
 			lh.V(4).Info("running with NRT modified by eviction simulation")
@@ -252,8 +255,21 @@ func (tm *TopologyMatch) Filter(ctx context.Context, cycleState fwk.CycleState, 
 	if !isPreemptionFlow && status != nil {
 		tm.nrtCache.NodeMaybeOverReserved(nodeName, pod)
 	}
+	if status.IsRejected() {
+		tm.noteRejectedPod(pod)
+	}
 
 	return status
+}
+
+// noteRejectedPod records a pod the over-reserve cache can wake after a flush.
+// Caches without a rejected-pod set ignore the call.
+func (tm *TopologyMatch) noteRejectedPod(pod *v1.Pod) {
+	tracker, ok := tm.nrtCache.(nrtcache.RejectedPodTracker)
+	if !ok {
+		return
+	}
+	tracker.NoteRejectedPod(pod)
 }
 
 func filterHandlerFromTopologyManager(conf nodeconfig.TopologyManager) (filterFn, string) {

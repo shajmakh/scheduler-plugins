@@ -22,6 +22,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
+
+	nrtcache "sigs.k8s.io/scheduler-plugins/pkg/noderesourcetopology/cache"
 	"sigs.k8s.io/scheduler-plugins/pkg/noderesourcetopology/logging"
 )
 
@@ -32,8 +34,19 @@ func (tm *TopologyMatch) Reserve(ctx context.Context, state fwk.CycleState, pod 
 	defer lh.V(4).Info(logging.FlowEnd)
 
 	tm.nrtCache.ReserveNodeResources(nodeName, pod)
+	tm.forgetRejectedPod(pod)
 	// can't fail
 	return fwk.NewStatus(fwk.Success, "")
+}
+
+// forgetRejectedPod drops a pod that has been placed. Unreserve leaves it forgotten;
+// the next Filter rejection records it again.
+func (tm *TopologyMatch) forgetRejectedPod(pod *corev1.Pod) {
+	tracker, ok := tm.nrtCache.(nrtcache.RejectedPodTracker)
+	if !ok {
+		return
+	}
+	tracker.ForgetPod(pod)
 }
 
 func (tm *TopologyMatch) Unreserve(ctx context.Context, state fwk.CycleState, pod *corev1.Pod, nodeName string) {

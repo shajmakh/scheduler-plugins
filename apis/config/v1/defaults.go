@@ -97,6 +97,8 @@ var (
 
 	defaultInformerMode = CacheInformerDedicated
 
+	defaultRequeueUnschedulablePods = RequeueUnschedulablePodsDisabled
+
 	defaultPreemptionMode = PreemptionDisabled
 
 	// Defaults for NetworkOverhead
@@ -223,6 +225,9 @@ func SetDefaults_NodeResourceTopologyMatchArgs(obj *NodeResourceTopologyMatchArg
 	}
 	if obj.Cache.InformerMode == nil {
 		obj.Cache.InformerMode = &defaultInformerMode
+	}
+	if obj.Cache.RequeueUnschedulablePods == nil {
+		obj.Cache.RequeueUnschedulablePods = &defaultRequeueUnschedulablePods
 	}
 
 	if obj.PreemptionMode == nil {

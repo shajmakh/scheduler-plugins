@@ -38,10 +38,16 @@ type fakeFilterCache struct {
 	nrt                *topologyv1alpha2.NodeResourceTopology
 	numaPlacement      *numaplacement.EncodedInfo
 	withTerminatedPods bool
-	maybeOverReserved  []string
+	// for testing the rejected pod paths tracking
+	stale             bool
+	maybeOverReserved []string
+	rejectedPods      []string
 }
 
 func (f *fakeFilterCache) GetCachedNRTCopy(_ context.Context, _ string, _ *v1.Pod) (*topologyv1alpha2.NodeResourceTopology, nrtcache.CachedNRTInfo) {
+	if f.stale {
+		return nil, nrtcache.CachedNRTInfo{Fresh: false}
+	}
 	if f.nrt == nil {
 		return nil, nrtcache.CachedNRTInfo{Fresh: true}
 	}
@@ -65,6 +71,33 @@ func (f *fakeFilterCache) ReserveNodeResources(string, *v1.Pod)   {}
 func (f *fakeFilterCache) UnreserveNodeResources(string, *v1.Pod) {}
 func (f *fakeFilterCache) PostBind(string, *v1.Pod)               {}
 func (f *fakeFilterCache) Close()                                 {}
+
+func (f *fakeFilterCache) NoteRejectedPod(pod *v1.Pod) {
+	if pod == nil || pod.Name == "" {
+		return
+	}
+	key := pod.Namespace + "/" + pod.Name
+	for _, existing := range f.rejectedPods {
+		if existing == key {
+			return
+		}
+	}
+	f.rejectedPods = append(f.rejectedPods, key)
+}
+
+func (f *fakeFilterCache) ForgetPod(pod *v1.Pod) {
+	if pod == nil {
+		return
+	}
+	key := pod.Namespace + "/" + pod.Name
+	kept := f.rejectedPods[:0]
+	for _, existing := range f.rejectedPods {
+		if existing != key {
+			kept = append(kept, existing)
+		}
+	}
+	f.rejectedPods = kept
+}
 
 func makePodWithQoS(namespace, name, containerName string, qos v1.PodQOSClass, cpu int64, memory string) *v1.Pod {
 	p := &v1.Pod{

@@ -44,17 +44,16 @@ var (
 type PodCacheHandlersOpts struct {
 	ForeignPodsDetect       bool
 	TerminatedOwnPodsDetect bool
+	// ForgetRejectedPods drops a same-profile pod from the rejected set on delete,
+	// including a pending pod whose nodeName is empty.
+	ForgetRejectedPods bool
 }
 
-// SetupPodCacheHandlers registers a single pod informer handler for foreign-pod detection
-// and/or same-profile terminated exclusive-resource pods.
-//
-// Add/Update run only when ForeignPodsDetect is set.
-// Delete branches: foreign first (other scheduler), else terminated own-profile
-// exclusive pods when TerminatedOwnPodsDetect is set. The two cases are mutually exclusive
-// by SchedulerName for a given profile.
+// SetupPodCacheHandlers registers a single pod informer handler for foreign-pod detection,
+// same-profile terminated exclusive-resource pods, and/or forgetting rejected pods according
+// to the passed options
 func SetupPodCacheHandlers(lh logr.Logger, profileName string, podInformer k8scache.SharedInformer, cc *OverReserve, opts PodCacheHandlersOpts) {
-	if !opts.ForeignPodsDetect && !opts.TerminatedOwnPodsDetect {
+	if !opts.ForeignPodsDetect && !opts.TerminatedOwnPodsDetect && !opts.ForgetRejectedPods {
 		return
 	}
 
@@ -68,30 +67,12 @@ func SetupPodCacheHandlers(lh logr.Logger, profileName string, podInformer k8sca
 	}
 
 	onDelete := func(obj interface{}) {
-		pod, ok := obj.(*corev1.Pod)
+		pod, ok := podFromDeleteEvent(obj)
 		if !ok {
-			// Informer may deliver Delete as DeletedFinalStateUnknown after watch gaps.
-			tombstone, ok := obj.(k8scache.DeletedFinalStateUnknown)
-			if !ok {
-				lh.V(3).Info("unsupported object", "kind", fmt.Sprintf("%T", obj))
-				return
-			}
-			pod, ok = tombstone.Obj.(*corev1.Pod)
-			if !ok {
-				lh.V(3).Info("unsupported object", "kind", fmt.Sprintf("%T", obj))
-				return
-			}
-		}
-		if pod.Spec.NodeName == "" {
+			lh.V(3).Info("unsupported object", "kind", fmt.Sprintf("%T", obj))
 			return
 		}
-
-		if opts.ForeignPodsDetect && handleForeignPod(lh, cc, pod) {
-			return
-		}
-		if opts.TerminatedOwnPodsDetect {
-			handleTerminatedOwnPod(lh, profileName, cc, pod)
-		}
+		handlePodDelete(lh, profileName, cc, pod, opts)
 	}
 
 	handlers := k8scache.ResourceEventHandlerFuncs{
@@ -104,6 +85,40 @@ func SetupPodCacheHandlers(lh logr.Logger, profileName string, podInformer k8sca
 		}
 	}
 	podInformer.AddEventHandler(handlers)
+}
+
+// podFromDeleteEvent returns the pod from a delete notification.
+// The informer may deliver DeletedFinalStateUnknown after a watch gap.
+func podFromDeleteEvent(obj interface{}) (*corev1.Pod, bool) {
+	pod, ok := obj.(*corev1.Pod)
+	if ok {
+		return pod, true
+	}
+	tombstone, ok := obj.(k8scache.DeletedFinalStateUnknown)
+	if !ok {
+		return nil, false
+	}
+	pod, ok = tombstone.Obj.(*corev1.Pod)
+	return pod, ok
+}
+
+// handlePodDelete forgets a same-profile rejected pod, then handles a bound pod as foreign or terminated.
+// Pending pods have an empty nodeName and still need to leave the rejected-pod set.
+// A pod scheduled by another profile is not removed.
+func handlePodDelete(lh logr.Logger, profileName string, cc *OverReserve, pod *corev1.Pod, opts PodCacheHandlersOpts) {
+	// Same comparison as handleTerminatedOwnPod: the handler already has this profile's name.
+	if opts.ForgetRejectedPods {
+		handleUnschedulablePod(lh, profileName, cc, pod)
+	}
+	if pod.Spec.NodeName == "" {
+		return
+	}
+	if opts.ForeignPodsDetect && handleForeignPod(lh, cc, pod) {
+		return
+	}
+	if opts.TerminatedOwnPodsDetect {
+		handleTerminatedOwnPod(lh, profileName, cc, pod)
+	}
 }
 
 // handleForeignPod marks the node if pod is foreign. Returns true if the pod was handled as foreign.
@@ -130,6 +145,14 @@ func handleTerminatedOwnPod(lh logr.Logger, profileName string, cc *OverReserve,
 	lh = lh.WithValues(logging.KeyPod, klog.KObj(pod), logging.KeyPodUID, logging.PodUID(pod), logging.KeyNode, pod.Spec.NodeName)
 	lh.V(4).Info("detected terminated own exclusive-resource pod")
 	cc.RemoveAssumedPodOnTermination(pod.Spec.NodeName, pod)
+}
+
+// handleRequeueUnschedulablePod removes a same-profile unschedulable pod from the rejected set.
+func handleUnschedulablePod(lh logr.Logger, profileName string, cc *OverReserve, pod *corev1.Pod) {
+	if pod.Spec.SchedulerName != profileName {
+		return
+	}
+	cc.ForgetPod(pod)
 }
 
 func TrackOnlyForeignPodsWithExclusiveResources() {

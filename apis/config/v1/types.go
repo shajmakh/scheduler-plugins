@@ -217,6 +217,17 @@ const (
 	PreemptionEnabled PreemptionMode = "Enabled"
 )
 
+// RequeueUnschedulablePodsMode is a "string" type.
+type RequeueUnschedulablePodsMode string
+
+const (
+	// RequeueUnschedulablePodsDisabled leaves rejected pods parked.
+	RequeueUnschedulablePodsDisabled RequeueUnschedulablePodsMode = "Disabled"
+	// RequeueUnschedulablePodsOnlyExclusiveResources records same-profile pods that Filter
+	// rejected for a reason a resync flush can clear, and wakes the ones that fit a flushed node.
+	RequeueUnschedulablePodsOnlyExclusiveResources RequeueUnschedulablePodsMode = "OnlyExclusiveResources"
+)
+
 // NodeResourceTopologyCache define configuration details for the NodeResourceTopology cache.
 type NodeResourceTopologyCache struct {
 	// ForeignPodsDetect sets how foreign pods should be handled.
@@ -255,6 +266,13 @@ type NodeResourceTopologyCache struct {
 	// "All" to make the code react to node config changes avoiding reboots.
 	// Use "OnlyResources" to restore the previous behavior.
 	ResyncScope *CacheResyncScope `json:"resyncScope,omitempty"`
+	// RequeueUnschedulablePods controls recording pods this profile rejected in Filter
+	// and removing them when they are deleted. "Disabled" does neither.
+	// "OnlyExclusiveResources" records same-profile pods whose rejection a resync flush can clear.
+	// Pods scheduled by another scheduler are ignored.
+	// Has no effect if caching is disabled (CacheResyncPeriod is zero) or if
+	// DiscardReservedNodes is enabled. Defaults to "Disabled".
+	RequeueUnschedulablePods *RequeueUnschedulablePodsMode `json:"requeueUnschedulablePods,omitempty"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

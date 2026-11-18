@@ -488,7 +488,7 @@ func TestFlush(t *testing.T) {
 	lh := testr.New(t)
 
 	expectedGen := nrtCache.generation + 1
-	gen1 := nrtCache.FlushNodes(lh, nrtUpdate{
+	gen1, _ := nrtCache.FlushNodes(lh, nrtUpdate{
 		nrt: expectedNodeTopology.DeepCopy(),
 	})
 	if gen1 != expectedGen {
@@ -514,9 +514,12 @@ func TestFlush(t *testing.T) {
 	}
 
 	// flush again without dirty nodes
-	gen2 := nrtCache.FlushNodes(lh)
+	gen2, flushed2 := nrtCache.FlushNodes(lh)
 	if gen2 != expectedGen {
 		t.Fatalf("generation shouldn't change with no dirty nodes\ngot %d expected %d", gen2, expectedGen)
+	}
+	if flushed2 != nil {
+		t.Fatalf("empty flush returned NRTs: %v", flushed2)
 	}
 }
 
@@ -1859,7 +1862,7 @@ func TestOverresevedGetCachedNRTCopyWithForeignPods(t *testing.T) {
 	}
 
 	// pointless, but will force a generation increase
-	gen := nrtCache.FlushNodes(lh, nrtUpdate{
+	gen, _ := nrtCache.FlushNodes(lh, nrtUpdate{
 		nrt: nrt,
 	})
 	if gen == 0 {
@@ -1999,4 +2002,127 @@ func TestRemoveAssumedPodOnTermination(t *testing.T) {
 			t.Fatalf("missing NRT node must not be marked WithTerminatedPods")
 		}
 	})
+}
+
+func TestRejectedPodsRecordOnceAndForget(t *testing.T) {
+	ov := &OverReserve{}
+	ov.EnableRequeueUnschedulablePods()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pending"}}
+	other := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "other"}}
+
+	ov.NoteRejectedPod(nil)
+	ov.NoteRejectedPod(&corev1.Pod{})
+	if ov.HasRejectedPod(pod) {
+		t.Fatal("empty pod was recorded")
+	}
+
+	ov.NoteRejectedPod(pod)
+	ov.NoteRejectedPod(pod)
+	ov.NoteRejectedPod(other)
+	if !ov.HasRejectedPod(pod) || !ov.HasRejectedPod(other) {
+		t.Fatalf("recorded pods: %#v", ov.rejectedPods)
+	}
+	if got := ov.rejectedPods.Len(); got != 2 {
+		t.Fatalf("rejected set len = %d, want 2", got)
+	}
+
+	ov.ForgetPod(pod)
+	if ov.HasRejectedPod(pod) {
+		t.Fatal("forgotten pod is still recorded")
+	}
+	if !ov.HasRejectedPod(other) {
+		t.Fatal("unrelated pod was dropped")
+	}
+
+	ov.ForgetPod(other)
+	if ov.rejectedPods.Len() != 0 {
+		t.Fatalf("rejected set after forget: %#v", ov.rejectedPods.UnsortedList())
+	}
+	ov.ForgetPod(other)
+}
+
+func TestNoteRejectedPodSkippedWhenRequeueDisabled(t *testing.T) {
+	ov := &OverReserve{}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pending"}}
+	ov.NoteRejectedPod(pod)
+	if ov.HasRejectedPod(pod) {
+		t.Fatal("recorded a pod while requeue is disabled")
+	}
+}
+
+func TestFlushNodesReturnsInstalledNRTs(t *testing.T) {
+	fakeClient, err := tu.NewFakeClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nrtCache := mustOverReserve(t, fakeClient, &fakePodLister{})
+	t.Cleanup(nrtCache.Close)
+	lh := testr.New(t)
+
+	nrt := makeDefaultTestTopology()[0].DeepCopy()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pending"}}
+
+	nrtCache.EnableRequeueUnschedulablePods()
+	nrtCache.NoteRejectedPod(pod)
+	if !nrtCache.RequeuesRejectedPods() {
+		t.Fatal("requeue mode not enabled")
+	}
+	if got := nrtCache.RejectedPodKeys(); len(got) != 1 || got[0] != "ns/pending" {
+		t.Fatalf("RejectedPodKeys = %v, want [ns/pending]", got)
+	}
+
+	gen, flushed := nrtCache.FlushNodes(lh, nrtUpdate{nrt: nrt}, nrtUpdate{})
+	if gen == 0 {
+		t.Fatal("generation did not increase")
+	}
+	if len(flushed) != 1 || flushed[0].Name != nrt.Name {
+		t.Fatalf("flushed = %v, want [%s]", flushed, nrt.Name)
+	}
+	// Keys stay recorded until Reserve or delete; flush only exposes them for the next step.
+	if got := nrtCache.RejectedPodKeys(); len(got) != 1 {
+		t.Fatalf("RejectedPodKeys after flush = %v", got)
+	}
+
+	gen2, flushed2 := nrtCache.FlushNodes(lh)
+	if gen2 != gen {
+		t.Fatalf("empty flush changed generation: got %d want %d", gen2, gen)
+	}
+	if flushed2 != nil {
+		t.Fatalf("empty flush returned %v", flushed2)
+	}
+}
+
+func TestFlushNodesReturnsNRTsWhenRequeueDisabled(t *testing.T) {
+	fakeClient, err := tu.NewFakeClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nrtCache := mustOverReserve(t, fakeClient, &fakePodLister{})
+	t.Cleanup(nrtCache.Close)
+	lh := testr.New(t)
+
+	nrt := makeDefaultTestTopology()[0].DeepCopy()
+	gen, flushed := nrtCache.FlushNodes(lh, nrtUpdate{nrt: nrt})
+	if gen == 0 {
+		t.Fatal("generation did not increase")
+	}
+	if len(flushed) != 1 || flushed[0].Name != nrt.Name {
+		t.Fatalf("flushed = %v, want [%s]", flushed, nrt.Name)
+	}
+	if nrtCache.RequeuesRejectedPods() {
+		t.Fatal("requeue unexpectedly enabled")
+	}
+}
+
+func TestForgetRejectedPodKey(t *testing.T) {
+	ov := &OverReserve{}
+	ov.EnableRequeueUnschedulablePods()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pending"}}
+	ov.NoteRejectedPod(pod)
+	ov.ForgetRejectedPodKey("ns/pending")
+	if ov.HasRejectedPod(pod) {
+		t.Fatal("key still recorded after ForgetRejectedPodKey")
+	}
+	ov.ForgetRejectedPodKey("")
+	ov.ForgetRejectedPodKey("ns/missing")
 }

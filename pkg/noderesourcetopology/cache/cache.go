@@ -148,3 +148,13 @@ type Interface interface {
 	// It is safe to call Close multiple times.
 	Close()
 }
+
+// RejectedPodTracker records pods that Filter rejected for a reason a later resync flush can clear.
+// The over-reserve cache implements it because it is used by node flush later, other caches do not require
+// this to be implemented if the set is not used in their flows.
+type RejectedPodTracker interface {
+	// NoteRejectedPod inserts the pod key if it is not already recorded.
+	NoteRejectedPod(pod *corev1.Pod)
+	// ForgetPod drops the pod key. A missing key is a no-op.
+	ForgetPod(pod *corev1.Pod)
+}

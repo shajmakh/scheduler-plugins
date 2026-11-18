@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	k8scache "k8s.io/client-go/tools/cache"
 )
 
 func TestIsForeignPod(t *testing.T) {
@@ -264,5 +265,68 @@ func TestIsForeignPod(t *testing.T) {
 				t.Errorf("%s: pod %q foreign status got %v expected %v", tt.name, tt.pod.Name, got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestHandlePodDeleteForgetsRejectedPod(t *testing.T) {
+	const profile = "sched"
+	pending := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pending"}, Spec: corev1.PodSpec{SchedulerName: profile}}
+	bound := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "bound"}, Spec: corev1.PodSpec{SchedulerName: profile, NodeName: "node-1"}}
+
+	t.Run("pending pod", func(t *testing.T) {
+		ov := &OverReserve{lh: testr.New(t)}
+		ov.EnableRequeueUnschedulablePods()
+		ov.NoteRejectedPod(pending)
+		handlePodDelete(testr.New(t), profile, ov, pending, PodCacheHandlersOpts{ForgetRejectedPods: true})
+		if ov.HasRejectedPod(pending) {
+			t.Fatal("deleted pending pod is still recorded")
+		}
+	})
+
+	t.Run("bound pod", func(t *testing.T) {
+		ov := &OverReserve{lh: testr.New(t)}
+		ov.EnableRequeueUnschedulablePods()
+		ov.NoteRejectedPod(bound)
+		handlePodDelete(testr.New(t), profile, ov, bound, PodCacheHandlersOpts{ForgetRejectedPods: true})
+		if ov.HasRejectedPod(bound) {
+			t.Fatal("deleted bound pod is still recorded")
+		}
+	})
+
+	t.Run("forget disabled leaves the key", func(t *testing.T) {
+		ov := &OverReserve{lh: testr.New(t)}
+		ov.EnableRequeueUnschedulablePods()
+		ov.NoteRejectedPod(pending)
+		handlePodDelete(testr.New(t), profile, ov, pending, PodCacheHandlersOpts{})
+		if !ov.HasRejectedPod(pending) {
+			t.Fatal("pod was forgotten while ForgetRejectedPods is off")
+		}
+	})
+
+	t.Run("foreign delete leaves the key", func(t *testing.T) {
+		ov := &OverReserve{lh: testr.New(t)}
+		ov.EnableRequeueUnschedulablePods()
+		ov.NoteRejectedPod(pending)
+		foreign := pending.DeepCopy()
+		foreign.Spec.SchedulerName = "other-scheduler"
+		handlePodDelete(testr.New(t), profile, ov, foreign, PodCacheHandlersOpts{ForgetRejectedPods: true})
+		if !ov.HasRejectedPod(pending) {
+			t.Fatal("foreign delete removed the recorded pod")
+		}
+	})
+}
+
+func TestPodFromDeleteEvent(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pending"}}
+	got, ok := podFromDeleteEvent(pod)
+	if !ok || got != pod {
+		t.Fatalf("direct pod: ok=%v pod=%v", ok, got)
+	}
+	got, ok = podFromDeleteEvent(k8scache.DeletedFinalStateUnknown{Obj: pod})
+	if !ok || got != pod {
+		t.Fatalf("tombstone: ok=%v pod=%v", ok, got)
+	}
+	if _, ok := podFromDeleteEvent("nope"); ok {
+		t.Fatal("non-pod object was accepted")
 	}
 }

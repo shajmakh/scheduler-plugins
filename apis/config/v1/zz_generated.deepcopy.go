@@ -290,6 +290,11 @@ func (in *NodeResourceTopologyCache) DeepCopyInto(out *NodeResourceTopologyCache
 		*out = new(CacheResyncScope)
 		**out = **in
 	}
+	if in.RequeueUnschedulablePods != nil {
+		in, out := &in.RequeueUnschedulablePods, &out.RequeueUnschedulablePods
+		*out = new(RequeueUnschedulablePodsMode)
+		**out = **in
+	}
 	return
 }
 

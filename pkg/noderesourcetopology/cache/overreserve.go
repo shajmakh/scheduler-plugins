@@ -75,6 +75,11 @@ type OverReserve struct {
 	watchCancel             context.CancelFunc
 	nrtWatcher              *Watcher
 	closeOnce               sync.Once
+	// rejectedMu guards rejectedPods. It is separate from lock so Filter can record a pod
+	// without queueing behind GetCachedNRTCopy or Resync.
+	rejectedMu               sync.Mutex
+	rejectedPods             sets.Set[string] // "namespace/name"
+	requeueUnschedulablePods apiconfig.RequeueUnschedulablePodsMode
 }
 
 func NewOverReserve(
@@ -114,6 +119,7 @@ func NewOverReserve(
 		resyncMethod:            resyncMethod,
 		preemptionMode:          preemptionMode,
 		watchCancel:             watchCancel,
+		rejectedPods:            sets.New[string](),
 	}
 
 	if resyncScope == apiconfig.CacheResyncScopeAll {
@@ -255,6 +261,75 @@ func (ov *OverReserve) closeCache() {
 	ov.nrtWatcher.Wait()
 }
 
+// EnableRequeueUnschedulablePods turns on rejected-pod tracking.
+// Startup calls this only when cache.requeueUnschedulablePods is OnlyExclusiveResources
+// and this profile name is known.
+func (ov *OverReserve) EnableRequeueUnschedulablePods() {
+	ov.requeueUnschedulablePods = apiconfig.RequeueUnschedulablePodsOnlyExclusiveResources
+}
+
+// NoteRejectedPod records a pod that failed Filter for a reason a resync flush may clear.
+// The entry is "namespace/name". A pod already recorded is left as it is, so repeated
+// Filter calls, including a preemption dry-run, do not add another entry.
+func (ov *OverReserve) NoteRejectedPod(pod *corev1.Pod) {
+	if ov.requeueUnschedulablePods != apiconfig.RequeueUnschedulablePodsOnlyExclusiveResources || pod == nil || pod.Name == "" {
+		return
+	}
+
+	ov.rejectedMu.Lock()
+	defer ov.rejectedMu.Unlock()
+	if ov.rejectedPods == nil {
+		ov.rejectedPods = sets.New[string]()
+	}
+	ov.lh.V(6).Info("recording rejected pod", "pod", rejectedPodKey(pod))
+	ov.rejectedPods.Insert(rejectedPodKey(pod))
+}
+
+// ForgetPod drops a recorded pod. Reserve calls this when the pod is placed,
+// and the pod delete handler calls it for a same-profile pending or bound pod.
+func (ov *OverReserve) ForgetPod(pod *corev1.Pod) {
+	if pod == nil || pod.Name == "" {
+		return
+	}
+
+	ov.rejectedMu.Lock()
+	defer ov.rejectedMu.Unlock()
+	ov.lh.V(6).Info("forgetting rejected pod", "pod", rejectedPodKey(pod))
+	ov.rejectedPods.Delete(rejectedPodKey(pod))
+}
+
+// HasRejectedPod reports whether the pod key is recorded.
+func (ov *OverReserve) HasRejectedPod(pod *corev1.Pod) bool {
+	if pod == nil || pod.Name == "" {
+		return false
+	}
+	ov.rejectedMu.Lock()
+	defer ov.rejectedMu.Unlock()
+	return ov.rejectedPods.Has(rejectedPodKey(pod))
+}
+
+// RequeuesRejectedPods reports whether cache.requeueUnschedulablePods is OnlyExclusiveResources.
+func (ov *OverReserve) RequeuesRejectedPods() bool {
+	return ov.requeueUnschedulablePods == apiconfig.RequeueUnschedulablePodsOnlyExclusiveResources
+}
+
+// RejectedPodKeys returns a copy of the recorded "namespace/name" keys to be tested against a flushed node.
+func (ov *OverReserve) RejectedPodKeys() []string {
+	ov.rejectedMu.Lock()
+	defer ov.rejectedMu.Unlock()
+	return ov.rejectedPods.UnsortedList()
+}
+
+// ForgetRejectedPodKey drops a key whose live pod is gone, bound, or no longer this profile.
+func (ov *OverReserve) ForgetRejectedPodKey(key string) {
+	if key == "" {
+		return
+	}
+	ov.rejectedMu.Lock()
+	defer ov.rejectedMu.Unlock()
+	ov.rejectedPods.Delete(key)
+}
+
 type DesyncedNodes struct {
 	Generation        uint64
 	MaybeOverReserved []string
@@ -332,7 +407,8 @@ func (ov *OverReserve) GetDesyncedNodes(lh logr.Logger) DesyncedNodes {
 // If *both* a node has pessimistic overallocation accounted to it *and* was discarded "too many" (how much is too much is a runtime parameter
 // which needs to be set and tuned) times, then it becomes a candidate for resync. Just using one of these two factors would lead to
 // too aggressive resync attempts, so to more, likely unnecessary, computation work on the scheduler side.
-func (ov *OverReserve) Resync() {
+// When RequeuesRejectedPods is enabled, it also returns the list of successfully flushed nodes in order to requeue rejected pods.
+func (ov *OverReserve) Resync() []*topologyv1alpha2.NodeResourceTopology {
 	// we are not working with a specific pod, so we need a unique key to track this flow
 	lh_ := ov.lh.WithName(logging.FlowCacheSync)
 	lh_.V(4).Info(logging.FlowBegin)
@@ -347,12 +423,13 @@ func (ov *OverReserve) Resync() {
 	// avoid as much as we can unnecessary work and logs.
 	if nodes.Len() == 0 {
 		lh_.V(5).Info("no dirty nodes detected")
-		return
+		return nil
 	}
 
 	nrtUpdates := ov.MakeNRTUpdates(context.Background(), lh_, nodes)
 
-	ov.FlushNodes(lh_, nrtUpdates...)
+	_, flushed := ov.FlushNodes(lh_, nrtUpdates...)
+	return flushed
 }
 
 // MakeNRTUpdates constructs the NRT updates for the dirty nodes by collecting
@@ -443,14 +520,16 @@ func (ov *OverReserve) nrtUpdateForFlush(nrt *topologyv1alpha2.NodeResourceTopol
 }
 
 // FlushNodes drops all the cached information about a given node, resetting its state clean.
-func (ov *OverReserve) FlushNodes(lh logr.Logger, nrtUpdates ...nrtUpdate) uint64 {
+// it returns the generation of the cache mostly for testing perposes and the list of successfully flushed NodeResourceTopology objects.
+func (ov *OverReserve) FlushNodes(lh logr.Logger, nrtUpdates ...nrtUpdate) (uint64, []*topologyv1alpha2.NodeResourceTopology) {
 	ov.lock.Lock()
 	defer ov.lock.Unlock()
 
 	if len(nrtUpdates) == 0 {
-		return ov.generation
+		return ov.generation, nil
 	}
 
+	flushed := make([]*topologyv1alpha2.NodeResourceTopology, 0, len(nrtUpdates))
 	for _, nrtUpdate := range nrtUpdates {
 		lh.V(2).Info("flushing", logging.KeyNode, nrtUpdate.nrt.Name)
 		ov.nrts.Update(nrtUpdate)
@@ -460,13 +539,19 @@ func (ov *OverReserve) FlushNodes(lh logr.Logger, nrtUpdates ...nrtUpdate) uint6
 		ov.nodesWithForeignPods.Delete(nrtUpdate.nrt.Name)
 		ov.nodesWithTerminatedPods.Delete(nrtUpdate.nrt.Name)
 		ov.nodesWithAttrUpdate.Delete(nrtUpdate.nrt.Name)
+		if !ov.RequeuesRejectedPods() {
+			continue
+		}
+		flushed = append(flushed, nrtUpdate.nrt)
 	}
 
 	// increase only if we mutated the internal state
 	ov.generation += 1
+	if len(flushed) == 0 {
+		return ov.generation, nil
+	}
 	lh.V(2).Info("generation", "new", ov.generation)
-	return ov.generation
-
+	return ov.generation, flushed
 }
 
 // to be used only in tests

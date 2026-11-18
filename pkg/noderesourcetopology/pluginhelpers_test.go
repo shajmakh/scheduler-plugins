@@ -267,3 +267,24 @@ func TestGetPreemptionMode(t *testing.T) {
 		})
 	}
 }
+
+func TestRequeueUnschedulablePodsEnabled(t *testing.T) {
+	disabled := apiconfig.RequeueUnschedulablePodsDisabled
+	onlyExclusive := apiconfig.RequeueUnschedulablePodsOnlyExclusiveResources
+	unknown := apiconfig.RequeueUnschedulablePodsMode("All")
+	if requeueUnschedulablePodsEnabled(nil) {
+		t.Fatal("nil config enabled requeue")
+	}
+	if requeueUnschedulablePodsEnabled(&apiconfig.NodeResourceTopologyCache{}) {
+		t.Fatal("empty config enabled requeue")
+	}
+	if requeueUnschedulablePodsEnabled(&apiconfig.NodeResourceTopologyCache{RequeueUnschedulablePods: &disabled}) {
+		t.Fatal("Disabled enabled requeue")
+	}
+	if requeueUnschedulablePodsEnabled(&apiconfig.NodeResourceTopologyCache{RequeueUnschedulablePods: &unknown}) {
+		t.Fatal("unrecognized mode enabled requeue")
+	}
+	if !requeueUnschedulablePodsEnabled(&apiconfig.NodeResourceTopologyCache{RequeueUnschedulablePods: &onlyExclusive}) {
+		t.Fatal("OnlyExclusiveResources did not enable requeue")
+	}
+}
